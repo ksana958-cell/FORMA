@@ -1,0 +1,14 @@
+{
+  "name": "forma-telegram-miniapp-bothost",
+  "version": "2.2.0",
+  "private": true,
+  "type": "module",
+  "description": "FORMA Dark — personal Telegram mini app, BotHost/Node.js + SQLite",
+  "engines": { "node": ">=22.13.0" },
+  "scripts": {
+    "start": "node app.js",
+    "test": "node scripts/test-bothost.mjs",
+    "bot:setup": "node scripts/setup-telegram.mjs"
+  },
+  "dependencies": {}
+}
