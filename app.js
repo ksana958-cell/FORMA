@@ -1,220 +1,140 @@
-/** FORMA API: Telegram auth, SQLite journal, photo estimation, Telegram reminders. Compatible with BotHost. */
-const json=(data,status=200)=>new Response(JSON.stringify(data),{status,headers:{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
-const fail=(message,status=400)=>json({error:message},status);
-const bounded=(x,min,max)=>Number.isFinite(Number(x))?Math.max(min,Math.min(max,Number(x))):min;
-const dayPattern=/^\d{4}-\d{2}-\d{2}$/;
-const validDay=v=>typeof v==='string'&&dayPattern.test(v)&&!Number.isNaN(Date.parse(v+'T12:00:00Z'));
-const validId=id=>typeof id==='string'&&/^[a-zA-Z0-9-]{8,64}$/.test(id);
-const readBody=async(request,max=90000)=>{const length=Number(request.headers.get('content-length')||0);if(length>max)throw Error('Слишком большой запрос');const text=await request.text();if(text.length>max)throw Error('Слишком большой запрос');return JSON.parse(text);};
-async function hmac(key,input){const k=await crypto.subtle.importKey('raw',key,{name:'HMAC',hash:'SHA-256'},false,['sign']);return new Uint8Array(await crypto.subtle.sign('HMAC',k,new TextEncoder().encode(input)));}
-function sameHex(bytes,hash){if(!/^[a-f0-9]{64}$/i.test(hash||''))return false;const target=Uint8Array.from(hash.match(/../g).map(x=>parseInt(x,16)));let diff=0;for(let i=0;i<bytes.length;i++)diff|=bytes[i]^target[i];return diff===0;}
-async function authUser(request,env){
- if(!env.BOT_TOKEN)throw Object.assign(Error('Не задан BOT_TOKEN'),{status:503});
- if(!env.OWNER_TELEGRAM_ID)throw Object.assign(Error('Задайте OWNER_TELEGRAM_ID в переменных BotHost'),{status:503});
- const raw=request.headers.get('X-Telegram-Init-Data')||'';if(!raw||raw.length>7000)throw Object.assign(Error('Открой приложение внутри Telegram'),{status:401});
- // HMAC validation: remove only `hash`. Telegram's additional `signature` field
- // is itself covered by the bot-token hash (unlike third-party Ed25519 validation).
- const params=new URLSearchParams(raw);
- const given=params.get('hash');
- params.delete('hash');
- const check=Array.from(params.entries())
-   .sort(([a],[b])=>a<b?-1:a>b?1:0)
-   .map(([k,v])=>`${k}=${v}`).join('\n');
- const key=await hmac(new TextEncoder().encode('WebAppData'),env.BOT_TOKEN);
- const expected=await hmac(key,check);
- if(!sameHex(expected,given)){
-   console.warn('[FORMA] Telegram initData HMAC mismatch. Received fields:',
-     Array.from(params.keys()).sort().join(','),
-     '| hasHash:',Boolean(given), '| botId:',String(env.BOT_TOKEN).split(':')[0]);
-   throw Object.assign(Error('Подпись Telegram не прошла проверку'),{status:401});
- }
- const t=Number(params.get('auth_date'));const now=Math.floor(Date.now()/1000);if(!t||t>now+60||now-t>86400)throw Object.assign(Error('Сессия истекла — открой Mini App снова'),{status:401});
- let user;try{user=JSON.parse(params.get('user')||'null')}catch{};if(!user?.id)throw Object.assign(Error('В Telegram не найден пользователь'),{status:401});
- if(String(user.id)!==String(env.OWNER_TELEGRAM_ID))throw Object.assign(Error('Приложение доступно только владельцу'),{status:403});
- return {id:String(user.id),first_name:String(user.first_name||'Глеб').slice(0,64)};
-}
-async function ensureUser(env,user){await env.DB.prepare('INSERT INTO users(user_id, first_name) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET first_name = excluded.first_name').bind(user.id,user.first_name).run();}
-async function telegram(env,method,payload){const res=await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json().catch(()=>({ok:false}));if(!res.ok||!data.ok)throw Error('Ошибка Telegram: '+(data.description||res.status));return data;}
-async function onTelegram(request,env){
- if(!env.BOT_TOKEN||!env.WEBHOOK_SECRET)return fail('Bot не настроен',503);
- if(request.headers.get('X-Telegram-Bot-Api-Secret-Token')!==env.WEBHOOK_SECRET)return fail('Forbidden',403);
- let update;try{update=await readBody(request,150000)}catch{return fail('Invalid update')};
- const msg=update.message;if(msg?.chat?.type==='private'&&typeof msg.text==='string'&&msg.text.startsWith('/start')){
-   const id=String(msg.from?.id||'');const allowed=env.OWNER_TELEGRAM_ID&&id===String(env.OWNER_TELEGRAM_ID);
-   if(!allowed){await telegram(env,'sendMessage',{chat_id:msg.chat.id,text:env.OWNER_TELEGRAM_ID?'Этот бот персональный и не принимает других пользователей.':`Привет! Твой Telegram ID: ${id}\nУкажи его как секрет OWNER_TELEGRAM_ID в переменных BotHost, затем перезапусти /start.`});return json({ok:true});}
-   await ensureUser(env,{id,first_name:msg.from?.first_name||'Глеб'});
-   await env.DB.prepare('UPDATE users SET chat_id = ? WHERE user_id = ?').bind(String(msg.chat.id),id).run();
-   const keyboard=env.APP_URL?{inline_keyboard:[[{text:'Открыть FORMA ↗',web_app:{url:env.APP_URL}}]]}:undefined;
-   await telegram(env,'sendMessage',{chat_id:msg.chat.id,text:'FORMA 🩷\n\nТвой дневник тренировок и питания готов. Открывай приложение, отмечай подходы и сохраняй еду.\n\nНапоминания включаются в настройках приложения.',...(keyboard?{reply_markup:keyboard}:{})});
- }
- return json({ok:true});
-}
-async function analyzeMeal(body,env){
- // The Gemini key is server-only. Never expose it to a Telegram WebView or to log output.
- if(!env.GEMINI_API_KEY) return fail('Распознавание пока не подключено: добавь GEMINI_API_KEY в переменные BotHost. Еду можно внести вручную.',503);
- const photo=body?.image;
- if(typeof photo!=='string'||photo.length>3600000||!/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(photo))return fail('Нужна сжатая фотография JPG, PNG или WEBP (до ~2,5 МБ)');
- const [meta,data]=photo.split(',',2),mimeType=meta.match(/^data:(image\/(?:jpeg|png|webp));base64$/)?.[1];
- if(!mimeType||!data)return fail('Неверный формат фото');
- const model=env.GEMINI_MODEL||'gemini-3.8-flash';
- if(!/^gemini-[a-z0-9.-]{2,64}$/i.test(model))return fail('Неверное имя модели GEMINI_MODEL',503);
- const schema={
-   type:'object',
-   properties:{
-     title:{type:'string',description:'Название блюда на русском'},
-     portion_grams:{type:'number'},calories:{type:'number'},protein:{type:'number'},fat:{type:'number'},carbs:{type:'number'},
-     notes:{type:'string',description:'Важные неопределённости и уточнения о порции'},
-     items:{type:'array',items:{type:'object',properties:{name:{type:'string'},grams:{type:'number'}},required:['name','grams']}}
-   },required:['title','portion_grams','calories','protein','fat','carbs','notes','items']
- };
- const prompt='Ты помощник по оценке состава еды по фото. Отвечай по-русски и только JSON. Определи видимое блюдо, основные ингредиенты и оцени БЖУ и калории на всю изображённую порцию. НЕ представляй цифры точными: без веса порции, рецепта и ингредиентов фотография не позволяет точно определить граммы, масло, заправки и калорийность. Если продукты неоднозначны, укажи это в notes. В notes обязательно предложи пользователю проверить размер порции, масло, соусы и скрытые ингредиенты. Не делай медицинских выводов. Числовые поля должны содержать неотрицательные приблизительные значения, а название блюда и ингредиентов — на русском языке.';
- const payload={
-   contents:[{role:'user',parts:[{text:prompt},{inline_data:{mime_type:mimeType,data}}]}],
-   generationConfig:{responseMimeType:'application/json',responseSchema:schema,maxOutputTokens:1200,temperature:0.2}
- };
- const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),40000);
- let result;
- try{
-   const res=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,{
-     method:'POST',headers:{'x-goog-api-key':env.GEMINI_API_KEY,'Content-Type':'application/json'},body:JSON.stringify(payload),signal:controller.signal
-   });
-   result=await res.json().catch(()=>null);
-   if(!res.ok){
-     const code=String(result?.error?.status||'');
-     console.warn('[FORMA] Gemini API error:',res.status,code,'model:',model);
-     if(res.status===400)return fail('Gemini отклонил запрос. Проверь выбранную модель GEMINI_MODEL в BotHost.',502);
-     if(res.status===401||res.status===403)return fail('Нет доступа к Gemini API. Проверь ключ, его проект и доступные разрешения.',502);
-     if(res.status===404)return fail('Модель Gemini не найдена или недоступна для проекта. Проверь GEMINI_MODEL.',502);
-     if(res.status===429)return fail('Бесплатный лимит Gemini API исчерпан или запросов слишком много. Попробуй позже либо внеси блюдо вручную.',429);
-     return fail('Сервис Gemini временно недоступен. Попробуй позже или внеси блюдо вручную.',502);
-   }
- }catch(e){return fail(e.name==='AbortError'?'Gemini отвечает слишком долго. Попробуй ещё раз.':'Не удалось соединиться с Gemini API. Проверь доступность сервиса.',502)}
- finally{clearTimeout(timeout)}
- const output=(result?.candidates?.[0]?.content?.parts||[]).map(p=>p.text||'').join('').trim();
- let parsed;
- try{parsed=JSON.parse(output);}catch{return fail('Gemini не смог распознать блюдо в нужном формате. Попробуй другую фотографию.',502)}
- if(!parsed||typeof parsed!=='object'||Array.isArray(parsed))return fail('Gemini вернул некорректный результат. Попробуй другое фото.',502);
- const clean={
-   title:String(parsed.title||'Блюдо').slice(0,120),portion_grams:bounded(parsed.portion_grams,0,3000),
-   calories:bounded(parsed.calories,0,10000),protein:bounded(parsed.protein,0,1000),
-   fat:bounded(parsed.fat,0,1000),carbs:bounded(parsed.carbs,0,1000),
-   notes:String(parsed.notes||'Это приблизительная оценка. Уточни размер порции, масла и соусы.').slice(0,450),
-   items:Array.isArray(parsed.items)?parsed.items.slice(0,15).map(i=>({name:String(i?.name||'Ингредиент').slice(0,80),grams:bounded(i?.grams,0,3000)})):[]
- };
- return json(clean);
-}
-async function handleApi(request,env){
- const path=new URL(request.url).pathname,method=request.method.toUpperCase();
- if(path==='/api/health')return json({ok:true,telegramConfigured:!!env.BOT_TOKEN,databaseConfigured:!!env.DB,aiConfigured:!!env.GEMINI_API_KEY,aiProvider:env.GEMINI_API_KEY?'gemini':null});
- const user=await authUser(request,env);if(!env.DB)return fail('База данных SQLite не подключена',503);
- await ensureUser(env,user);const uid=user.id;
- if(path==='/api/bootstrap'&&method==='GET'){
-  const [settings,workouts,meals,weights]=await Promise.all([
-   env.DB.prepare('SELECT * FROM users WHERE user_id = ?').bind(uid).first(),
-   env.DB.prepare('SELECT * FROM workouts WHERE user_id=? ORDER BY date DESC, completed_at DESC LIMIT 200').bind(uid).all(),
-   env.DB.prepare('SELECT * FROM meals WHERE user_id=? ORDER BY date DESC, created_at DESC LIMIT 1000').bind(uid).all(),
-   env.DB.prepare('SELECT date,kg FROM weights WHERE user_id=? ORDER BY date DESC LIMIT 120').bind(uid).all()
-  ]);
-  return json({user:settings,workouts:(workouts.results||[]).map(x=>({...x,exercises:JSON.parse(x.exercises_json)})),meals:(meals.results||[]).map(x=>({...x,items:JSON.parse(x.items_json)})),weights:weights.results||[]});
- }
- if(path==='/api/v2/bootstrap'&&method==='GET'){
-  const [waists,favorites,photos]=await Promise.all([
-   env.DB.prepare('SELECT date,cm FROM waists WHERE user_id=? ORDER BY date DESC LIMIT 150').bind(uid).all(),
-   env.DB.prepare('SELECT id,title,meal_type,calories,protein,fat,carbs,items_json FROM favorites WHERE user_id=? ORDER BY created_at DESC LIMIT 100').bind(uid).all(),
-   env.DB.prepare('SELECT id,date FROM progress_photos WHERE user_id=? ORDER BY date DESC LIMIT 20').bind(uid).all()
-  ]);
-  return json({waists:waists.results||[],favorites:(favorites.results||[]).map(f=>({...f,items:JSON.parse(f.items_json||'[]')})),photos:photos.results||[]});
- }
- if(path==='/api/measurements'&&method==='POST'){
-  const b=await readBody(request,2000);if(!validDay(b.date))return fail('Некорректная дата');
-  const hasK=b.kg!==undefined,hasC=b.cm!==undefined;if(!hasK&&!hasC)return fail('Укажи вес или талию');
-  if(hasK){if(!Number.isFinite(Number(b.kg))||Number(b.kg)<30||Number(b.kg)>300)return fail('Проверь вес');await env.DB.prepare('INSERT INTO weights(user_id,date,kg) VALUES(?,?,?) ON CONFLICT(user_id,date) DO UPDATE SET kg=excluded.kg').bind(uid,b.date,Number(b.kg)).run();}
-  if(hasC){if(!Number.isFinite(Number(b.cm))||Number(b.cm)<40||Number(b.cm)>200)return fail('Проверь окружность талии');await env.DB.prepare('INSERT INTO waists(user_id,date,cm) VALUES(?,?,?) ON CONFLICT(user_id,date) DO UPDATE SET cm=excluded.cm').bind(uid,b.date,Number(b.cm)).run();}
-  return json({ok:true});
- }
- if(path==='/api/favorites'&&method==='POST'){
-  const b=await readBody(request,12000);if(!validId(b.id)||typeof b.title!=='string'||!b.title.trim()||b.title.length>120||!['breakfast','lunch','dinner','snack'].includes(b.meal_type))return fail('Некорректное блюдо');
-  const items=Array.isArray(b.items)?b.items.slice(0,20):[];
-  await env.DB.prepare('INSERT OR IGNORE INTO favorites(id,user_id,title,meal_type,calories,protein,fat,carbs,items_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)').bind(b.id,uid,b.title.trim(),b.meal_type,bounded(b.calories,0,10000),bounded(b.protein,0,1000),bounded(b.fat,0,1000),bounded(b.carbs,0,1000),JSON.stringify(items),new Date().toISOString()).run();return json({ok:true});
- }
- if(path.startsWith('/api/favorites/')&&method==='DELETE'){
-  const id=decodeURIComponent(path.slice('/api/favorites/'.length));if(!validId(id))return fail('Некорректный ID');await env.DB.prepare('DELETE FROM favorites WHERE id=? AND user_id=?').bind(id,uid).run();return json({ok:true});
- }
- if(path.startsWith('/api/barcode/')&&method==='GET'){
-  const code=path.slice('/api/barcode/'.length);if(!/^\d{8,14}$/.test(code))return fail('Неверный штрихкод');
-  if(!env.OFF_CONTACT)return fail('Для каталога штрихкодов настрой OFF_CONTACT: контактный email приложения на сервере.',503);
-  try{const url=`https://world.openfoodfacts.org/api/v2/product/${code}?fields=product_name,product_name_ru,nutriments,quantity`;
-   const res=await fetch(url,{headers:{'User-Agent':`FORMA/2.0 (contact: ${String(env.OFF_CONTACT).slice(0,120)})`},signal:AbortSignal.timeout(12000)});
-   if(!res.ok)return fail('Сервис штрихкодов временно недоступен',502);
-   const data=await res.json();if(!data?.product)return fail('Продукт не найден. Добавь его вручную.',404);
-   const p=data.product,n=p.nutriments||{};
-   const val=k=>Number.isFinite(Number(n[k]))?Number(n[k]):null;
-   const energy=val('energy-kcal_100g')??(val('energy-kj_100g')!==null?val('energy-kj_100g')/4.184:null);
-   if(energy===null)return fail('У этого продукта нет данных по калориям — проверь этикетку.',422);
-   return json({title:String(p.product_name_ru||p.product_name||'Продукт').slice(0,120),calories:Math.round(energy),protein:bounded(val('proteins_100g'),0,100),fat:bounded(val('fat_100g'),0,100),carbs:bounded(val('carbohydrates_100g'),0,100),portion_grams:100,items:[],notes:'Средние значения из Open Food Facts на 100 г. Пожалуйста, проверь упаковку.'});
-  }catch{return fail('Не удалось обратиться к каталогу продуктов',502)}
- }
- if(path==='/api/progress-photos'&&method==='POST'){
-  if(!env.MEDIA)return fail('Хранилище фотографий не настроено. Проверь DATA_DIR на BotHost.',503);
-  const b=await readBody(request,450000);if(!validId(b.id)||!validDay(b.date)||typeof b.image!=='string'||b.image.length>400000||!/^data:image\/jpeg;base64,[a-zA-Z0-9+/=]+$/.test(b.image))return fail('Неверный формат фото');
-  const bytes=Uint8Array.from(atob(b.image.split(',')[1]),c=>c.charCodeAt(0));if(bytes.length>300000)return fail('Фото слишком большое');
-  const count=await env.DB.prepare('SELECT COUNT(*) AS cnt FROM progress_photos WHERE user_id=?').bind(uid).first();if((count?.cnt||0)>=16)return fail('Максимум 16 фотографий');
-  const objKey=`${uid}/${b.id}.jpg`;await env.MEDIA.put(objKey,bytes,{httpMetadata:{contentType:'image/jpeg'}});
-  await env.DB.prepare('INSERT OR IGNORE INTO progress_photos(id,user_id,date,object_key,created_at) VALUES(?,?,?,?,?)').bind(b.id,uid,b.date,objKey,new Date().toISOString()).run();return json({ok:true});
- }
- if(path.startsWith('/api/progress-photos/')&&method==='DELETE'){
-  const id=path.slice('/api/progress-photos/'.length);if(!validId(id))return fail('Неверный ID');
-  const rec=await env.DB.prepare('SELECT object_key FROM progress_photos WHERE id=? AND user_id=?').bind(id,uid).first();if(!rec)return fail('Фото не найдено',404);
-  await env.DB.prepare('DELETE FROM progress_photos WHERE id=? AND user_id=?').bind(id,uid).run();
-  if(env.MEDIA)await env.MEDIA.delete(rec.object_key);return json({ok:true});
- }
- if(path.startsWith('/api/progress-photos/')&&method==='GET'){
-  if(!env.MEDIA)return fail('Фотохранилище не подключено',503);
-  const id=path.slice('/api/progress-photos/'.length);if(!validId(id))return fail('Неверный ID');
-  const rec=await env.DB.prepare('SELECT object_key FROM progress_photos WHERE id=? AND user_id=?').bind(id,uid).first();if(!rec)return fail('Фото не найдено',404);
-  const obj=await env.MEDIA.get(rec.object_key);if(!obj)return fail('Фото отсутствует в хранилище',404);
-  const array=new Uint8Array(await obj.arrayBuffer());let result='';for(let i=0;i<array.length;i+=8192)result+=String.fromCharCode(...array.slice(i,i+8192));return json({image:'data:image/jpeg;base64,'+btoa(result)});
- }
- if(path==='/api/workouts'&&method==='POST'){
-  const b=await readBody(request,35000);if(!validId(b.id)||!validDay(b.date)||!['mon','wed','fri'].includes(b.day_id)||!Array.isArray(b.exercises)||b.exercises.length>15)return fail('Некорректная тренировка');
-  const exercises=b.exercises.map(x=>({key:String(x.key||'').slice(0,50),sets:Array.isArray(x.sets)?x.sets.slice(0,12).map(s=>({reps:bounded(s.reps,0,300),weight:bounded(s.weight,0,100),done:!!s.done})):[]}));
-  await env.DB.prepare('INSERT OR IGNORE INTO workouts (id,user_id,date,day_id,duration_sec,exercises_json,completed_at) VALUES (?,?,?,?,?,?,?)').bind(b.id,uid,b.date,b.day_id,Math.round(bounded(b.duration_sec,0,20000)),JSON.stringify(exercises),new Date().toISOString()).run();return json({ok:true});
- }
- if(path.startsWith('/api/workouts/')&&method==='DELETE'){
-  const id=decodeURIComponent(path.slice('/api/workouts/'.length));if(!validId(id))return fail('Некорректный идентификатор');
-  const row=await env.DB.prepare('SELECT exercises_json FROM workouts WHERE id=? AND user_id=?').bind(id,uid).first();
-  if(!row)return fail('Запись не найдена',404);
-  if(JSON.parse(row.exercises_json||'[]').length)return fail('Можно удалить только ручную отметку',403);
-  await env.DB.prepare('DELETE FROM workouts WHERE id=? AND user_id=?').bind(id,uid).run();return json({ok:true});
- }
- if(path==='/api/settings'&&method==='POST'){
-  const b=await readBody(request);const time=String(b.reminder_time||'18:00');if(!/^(?:0[8-9]|1[0-9]|20):(?:00|15|30|45)$/.test(time))return fail('Время напоминания должно быть с 08:00 до 20:45');
-  let tz=String(b.timezone||'Europe/Moscow').slice(0,90);try{new Intl.DateTimeFormat('en',{timeZone:tz})}catch{tz='Europe/Moscow'}
-  await env.DB.prepare('UPDATE users SET calorie_goal=?,protein_goal=?,fat_goal=?,carb_goal=?,reminder_enabled=?,reminder_time=?,timezone=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=?').bind(Math.round(bounded(b.calorie_goal,1000,6000)),Math.round(bounded(b.protein_goal,40,400)),Math.round(bounded(b.fat_goal,20,200)),Math.round(bounded(b.carb_goal,40,800)),b.reminder_enabled?1:0,time,tz,uid).run();return json({ok:true});
- }
- if(path==='/api/weight'&&method==='POST'){
-  const b=await readBody(request);if(!validDay(b.date)||bounded(b.kg,0,500)<30||bounded(b.kg,0,500)>300)return fail('Неверный вес или дата');await env.DB.prepare('INSERT INTO weights(user_id,date,kg) VALUES(?,?,?) ON CONFLICT(user_id,date) DO UPDATE SET kg=excluded.kg').bind(uid,b.date,bounded(b.kg,30,300)).run();return json({ok:true});
- }
- if(path==='/api/meals'&&method==='POST'){
-  const b=await readBody(request,14000);if(!validId(b.id)||!validDay(b.date)||!['breakfast','lunch','dinner','snack'].includes(b.meal_type)||typeof b.title!=='string'||!b.title.trim()||b.title.length>120)return fail('Проверь название блюда и дату');const items=Array.isArray(b.items)?b.items.slice(0,15):[];
-  await env.DB.prepare('INSERT OR IGNORE INTO meals(id,user_id,date,meal_type,title,calories,protein,fat,carbs,items_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)').bind(b.id,uid,b.date,b.meal_type,b.title.trim(),Math.round(bounded(b.calories,0,10000)),bounded(b.protein,0,1000),bounded(b.fat,0,1000),bounded(b.carbs,0,1000),JSON.stringify(items),new Date().toISOString()).run();return json({ok:true});
- }
- if(path.startsWith('/api/meals/')&&method==='DELETE'){
-  const id=decodeURIComponent(path.slice('/api/meals/'.length));if(!validId(id))return fail('Некорректный идентификатор');await env.DB.prepare('DELETE FROM meals WHERE id=? AND user_id=?').bind(id,uid).run();return json({ok:true});
- }
- if(path==='/api/analyze'&&method==='POST'){const b=await readBody(request,4000000);return await analyzeMeal(b,env);}
- return fail('Маршрут не найден',404);
-}
-async function runReminders(env){if(!env.DB||!env.BOT_TOKEN)return;const now=new Date();const rows=await env.DB.prepare('SELECT user_id,chat_id,timezone,reminder_time,last_reminder_day FROM users WHERE reminder_enabled=1 AND chat_id IS NOT NULL').all();for(const u of rows.results||[]){try{
-  const parts=new Intl.DateTimeFormat('en-US',{timeZone:u.timezone||'Europe/Moscow',weekday:'short',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false,hourCycle:'h23'}).formatToParts(now);
-  const p=Object.fromEntries(parts.map(x=>[x.type,x.value]));if(!['Mon','Wed','Fri'].includes(p.weekday))continue;
-  const date=`${p.year}-${p.month}-${p.day}`;if(u.last_reminder_day===date)continue;const time=`${p.hour.padStart(2,'0')}:${p.minute}`;const [hour,minute]=time.split(':').map(Number);const [targetHour,targetMinute]=u.reminder_time.split(':').map(Number);const delta=(hour*60+minute)-(targetHour*60+targetMinute);if(delta<0||delta>=60)continue;
-  const completed=await env.DB.prepare('SELECT id FROM workouts WHERE user_id=? AND date=? LIMIT 1').bind(u.user_id,date).first();if(completed)continue;
-  const type={Mon:'грудь, ноги и руки',Wed:'спина, плечи и ноги',Fri:'грудь, руки и предплечья'}[p.weekday];
-  await telegram(env,'sendMessage',{chat_id:u.chat_id,text:`FORMA · день тренировки 💪\n\nСегодня в плане: ${type}.\nОткрой приложение, чтобы начать и отметить подходы.`,...(env.APP_URL?{reply_markup:{inline_keyboard:[[{text:'Начать тренировку ↗',web_app:{url:env.APP_URL}}]]}}:{})});
-  await env.DB.prepare('UPDATE users SET last_reminder_day=? WHERE user_id=?').bind(date,u.user_id).run();
- }catch(error){console.error('Reminder error:',String(error).slice(0,120));}}}
-export default {
- async fetch(request,env){const path=new URL(request.url).pathname;try{if(path==='/telegram/webhook'){if(request.method!=='POST')return fail('Method not allowed',405);return await onTelegram(request,env);}if(path.startsWith('/api/'))return await handleApi(request,env);return env.ASSETS.fetch(request);}catch(error){console.error('Worker error:',error?.message||'error');return fail(error?.status?error.message:'Произошла ошибка сервера, попробуй снова.',error?.status||500);}},
- async scheduled(event,env,ctx){ctx.waitUntil(runReminders(env));}
+/** FORMA BotHost entry point. Dependency-free Node 22.13+/24 server. */
+import { createServer } from 'node:http';
+import { readFile, writeFile, mkdir, unlink, stat } from 'node:fs/promises';
+import { readFileSync, mkdirSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+import { resolve, join, extname, sep, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import worker from './src/worker.js';
+
+const ROOT = dirname(fileURLToPath(import.meta.url));
+const PUBLIC = join(ROOT, 'public');
+const DATA_DIR = resolve(process.env.DATA_DIR || join(ROOT, 'data'));
+const PORT = Number(process.env.PORT || 3000);
+const envToken = process.env.BOT_TOKEN?.trim() || '';
+const APP_URL = (process.env.PUBLIC_BASE_URL || '').trim().replace(/\/+$/, '');
+const WEBHOOK_SECRET = (process.env.WEBHOOK_SECRET || '').trim();
+
+mkdirSync(DATA_DIR, { recursive: true });
+const database = new DatabaseSync(join(DATA_DIR, 'forma.sqlite'), { timeout: 5000 });
+database.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
+database.exec(readFileSync(join(ROOT,'schema.sql'), 'utf8'));
+
+// D1-style adapter to keep all existing API endpoints and validation intact.
+const DB = { prepare(sql) { return {
+  bind(...values) {
+    const stmt = database.prepare(sql);
+    return {
+      async first() { return stmt.get(...values) || null; },
+      async all() { return { results: stmt.all(...values) }; },
+      async run() { return stmt.run(...values); }
+    };
+  }
+}; }};
+const MEDIA_ROOT = join(DATA_DIR, 'private-photos');
+const mediaPath = key => {
+  if (!/^\d{1,20}\/[-a-zA-Z0-9]{8,64}\.jpg$/.test(key)) throw Error('Bad media key');
+  const candidate = resolve(MEDIA_ROOT, key);
+  if (!candidate.startsWith(resolve(MEDIA_ROOT) + sep)) throw Error('Unsafe path');
+  return candidate;
 };
+const MEDIA = {
+  async put(key, bytes) { const p=mediaPath(key); await mkdir(dirname(p),{recursive:true}); await writeFile(p,bytes,{flag:'wx'}); },
+  async get(key) { try { const data=await readFile(mediaPath(key)); return { async arrayBuffer() { return Uint8Array.from(data).buffer; } }; } catch (e) { if (e.code==='ENOENT') return null; throw e; } },
+  async delete(key) { try { await unlink(mediaPath(key)); } catch (e) { if (e.code!=='ENOENT') throw e; } }
+};
+const MIME = { '.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.json':'application/json; charset=utf-8','.svg':'image/svg+xml','.jpg':'image/jpeg','.jpeg':'image/jpeg','.png':'image/png','.gif':'image/gif','.webp':'image/webp','.ico':'image/x-icon','.mp4':'video/mp4','.woff2':'font/woff2' };
+const ASSETS = {async fetch(request) {
+  const url=new URL(request.url);
+  const location=url.pathname==='/'?'/index.html':url.pathname;
+  let decoded;
+  try { decoded=decodeURIComponent(location); } catch { return new Response('Bad URL',{status:400}); }
+  const segments=decoded.split('/');
+  if (segments.some(s=>s==='..'||s==='.'||s.startsWith('.')) || decoded.includes('\\') || decoded.includes('\0')) return new Response('Not found',{status:404});
+  const full=resolve(PUBLIC,'.'+decoded);
+  if (!full.startsWith(resolve(PUBLIC)+sep)) return new Response('Not found',{status:404});
+  const ext=extname(full).toLowerCase();
+  if (!MIME[ext]) return new Response('Not found',{status:404});
+  try {
+    const meta=await stat(full);
+    if (!meta.isFile() || meta.size>8*1024*1024) return new Response('Not found',{status:404});
+    const data=await readFile(full);
+    return new Response(data,{status:200,headers:{'Content-Type':MIME[ext],'Cache-Control':ext==='.html'?'no-store':'public, max-age=3600','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'}});
+  } catch (e) { if (e.code==='ENOENT'||e.code==='EISDIR') return new Response('Not found',{status:404}); throw e; }
+}};
+const env = {
+  BOT_TOKEN: envToken,
+  OWNER_TELEGRAM_ID: process.env.OWNER_TELEGRAM_ID?.trim(),
+  APP_URL,
+  WEBHOOK_SECRET,
+  GEMINI_API_KEY: process.env.GEMINI_API_KEY?.trim(),
+  GEMINI_MODEL: process.env.GEMINI_MODEL?.trim() || 'gemini-3.8-flash',
+  OFF_CONTACT: process.env.OFF_CONTACT?.trim(),
+  DB, MEDIA, ASSETS
+};
+
+async function registerTelegram() {
+  if (!envToken || !APP_URL || !WEBHOOK_SECRET) {
+    console.log('[FORMA] Telegram webhook not configured yet. Set BOT_TOKEN, PUBLIC_BASE_URL, WEBHOOK_SECRET.');
+    return;
+  }
+  if (!/^https:\/\/[a-z0-9.-]+(?::\d+)?$/i.test(APP_URL) || !/^[a-zA-Z0-9_-]{16,256}$/.test(WEBHOOK_SECRET)) {
+    console.error('[FORMA] Invalid PUBLIC_BASE_URL (HTTPS) or WEBHOOK_SECRET (16–256 chars A-Z 0-9 _ -).');
+    return;
+  }
+  const call=async(method,payload)=>{
+    const r=await fetch(`https://api.telegram.org/bot${envToken}/${method}`, {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload),signal:AbortSignal.timeout(12000)});
+    const data=await r.json();if(!r.ok||!data.ok)throw Error(`${method}: ${data.description||r.status}`);return data.result;
+  };
+  try {
+    await call('setWebhook',{url:`${APP_URL}/telegram/webhook`,secret_token:WEBHOOK_SECRET,allowed_updates:['message'],drop_pending_updates:false});
+    await call('setChatMenuButton',{menu_button:{type:'web_app',text:'Открыть FORMA',web_app:{url:APP_URL}}});
+    console.log('[FORMA] Telegram webhook and menu button configured.');
+    // Bot username is public. Display it for troubleshooting when initData comes from a different bot.
+    try {const bot=await call('getMe',{}); console.log(`[FORMA] Connected Telegram bot: @${bot.username} (id ${bot.id})`);}
+    catch (e) {console.warn('[FORMA] Bot identity check failed:', String(e.message).slice(0,160));}
+  } catch (error) { console.warn('[FORMA] Telegram setup failed:',String(error.message).slice(0,250)); }
+}
+
+let reminderBusy=false;
+async function checkReminders() {
+  if (reminderBusy || !envToken) return;
+  reminderBusy=true;
+  try { await worker.scheduled(null,env,{waitUntil(p){ return Promise.resolve(p).catch(e=>console.error('[FORMA] reminder:',e.message)); }}); }
+  catch (e) { console.error('[FORMA] reminder scheduler:',e.message); }
+  finally { reminderBusy=false; }
+}
+
+const server=createServer(async(req,res)=>{
+  try {
+    const pathname=new URL(req.url||'/', 'http://localhost').pathname;
+    const method=req.method||'GET';
+    if (!['GET','POST','DELETE','HEAD'].includes(method)) {res.writeHead(405);res.end('Method not allowed');return;}
+    const max=4_500_000;
+    if (Number(req.headers['content-length'])>max) {res.writeHead(413);res.end('Payload too large');return;}
+    const body=[];let bytes=0;
+    if (method==='POST'||method==='DELETE') {
+      for await (const chunk of req) {bytes+=chunk.length;if(bytes>max){res.writeHead(413);res.end('Payload too large');return;}body.push(chunk);}
+    }
+    const url=`http://127.0.0.1:${PORT}${req.url||'/'}`;
+    const request=new Request(url,{method,headers:req.headers,...(body.length?{body:Buffer.concat(body)}:{})});
+    const response=await worker.fetch(request,env);
+    res.statusCode=response.status;
+    for (const [key,value] of response.headers) res.setHeader(key,value);
+    res.setHeader('X-Content-Type-Options','nosniff');
+    res.setHeader('Referrer-Policy','no-referrer');
+    res.setHeader('X-Frame-Options','SAMEORIGIN');
+    res.setHeader('Permissions-Policy','camera=(self)');
+    if (pathname.startsWith('/api/')||pathname==='/telegram/webhook') res.setHeader('Cache-Control','no-store');
+    if (method==='HEAD') {res.end();return;}
+    res.end(Buffer.from(await response.arrayBuffer()));
+  } catch(error) {console.error('[FORMA] request:',error.message);if(!res.headersSent){res.writeHead(500,{'Content-Type':'application/json'});res.end(JSON.stringify({error:'Ошибка сервера'}));}else res.end();}
+});
+server.listen(PORT,'0.0.0.0',()=>{
+  console.log(`[FORMA] Listening on 0.0.0.0:${PORT}; SQLite and photos in ${DATA_DIR}`);
+  void registerTelegram();
+  void checkReminders();
+});
+const ticker=setInterval(()=>void checkReminders(),60_000);
+ticker.unref();
+process.on('SIGTERM',()=>{clearInterval(ticker);server.close(()=>{database.close();process.exit(0)});setTimeout(()=>process.exit(1),4000).unref();});
