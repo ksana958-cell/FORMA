@@ -12,8 +12,22 @@ async function authUser(request,env){
  if(!env.BOT_TOKEN)throw Object.assign(Error('Не задан BOT_TOKEN'),{status:503});
  if(!env.OWNER_TELEGRAM_ID)throw Object.assign(Error('Задайте OWNER_TELEGRAM_ID в переменных BotHost'),{status:503});
  const raw=request.headers.get('X-Telegram-Init-Data')||'';if(!raw||raw.length>7000)throw Object.assign(Error('Открой приложение внутри Telegram'),{status:401});
- const params=new URLSearchParams(raw);const given=params.get('hash');params.delete('hash');params.delete('signature');const check=Array.from(params.entries()).sort(([a],[b])=>a.localeCompare(b)).map(([k,v])=>`${k}=${v}`).join('\n');const key=await hmac(new TextEncoder().encode('WebAppData'),env.BOT_TOKEN);const expected=await hmac(key,check);
- if(!sameHex(expected,given))throw Object.assign(Error('Подпись Telegram не прошла проверку'),{status:401});
+ // HMAC validation: remove only `hash`. Telegram's additional `signature` field
+ // is itself covered by the bot-token hash (unlike third-party Ed25519 validation).
+ const params=new URLSearchParams(raw);
+ const given=params.get('hash');
+ params.delete('hash');
+ const check=Array.from(params.entries())
+   .sort(([a],[b])=>a<b?-1:a>b?1:0)
+   .map(([k,v])=>`${k}=${v}`).join('\n');
+ const key=await hmac(new TextEncoder().encode('WebAppData'),env.BOT_TOKEN);
+ const expected=await hmac(key,check);
+ if(!sameHex(expected,given)){
+   console.warn('[FORMA] Telegram initData HMAC mismatch. Received fields:',
+     Array.from(params.keys()).sort().join(','),
+     '| hasHash:',Boolean(given), '| botId:',String(env.BOT_TOKEN).split(':')[0]);
+   throw Object.assign(Error('Подпись Telegram не прошла проверку'),{status:401});
+ }
  const t=Number(params.get('auth_date'));const now=Math.floor(Date.now()/1000);if(!t||t>now+60||now-t>86400)throw Object.assign(Error('Сессия истекла — открой Mini App снова'),{status:401});
  let user;try{user=JSON.parse(params.get('user')||'null')}catch{};if(!user?.id)throw Object.assign(Error('В Telegram не найден пользователь'),{status:401});
  if(String(user.id)!==String(env.OWNER_TELEGRAM_ID))throw Object.assign(Error('Приложение доступно только владельцу'),{status:403});
