@@ -1,14 +1,17 @@
 {
   "name": "forma-telegram-miniapp-bothost",
-  "version": "2.3.0",
+  "version": "2.6.0",
   "private": true,
   "type": "module",
-  "description": "FORMA Dark — personal Telegram mini app, BotHost/Node.js + SQLite",
-  "engines": { "node": ">=22.13.0" },
+  "description": "FORMA — personal workout, calendar and progress tracker for BotHost",
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "scripts": {
     "start": "node app.js",
-    "test": "node scripts/test-bothost.mjs && node scripts/test-gemini.mjs",
-    "bot:setup": "node scripts/setup-telegram.mjs"
+    "test": "node scripts/test-media.mjs && node scripts/test-interface.mjs && node scripts/test-bothost.mjs && node scripts/test-reminders.mjs",
+    "bot:setup": "node scripts/setup-telegram.mjs",
+    "preview:build": "node scripts/build-preview.mjs"
   },
   "dependencies": {}
 }

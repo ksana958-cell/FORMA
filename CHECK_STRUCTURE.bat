@@ -1,8 +1,10 @@
 @echo off
 cd /d "%~dp0"
-if not exist "src\worker.js" echo MISSING src\worker.js & exit /b 1
-if not exist "public\index.html" echo MISSING public\index.html & exit /b 1
-if not exist "public\app.js" echo MISSING public\app.js & exit /b 1
-if not exist "scripts\setup-telegram.mjs" echo MISSING scripts\setup-telegram.mjs & exit /b 1
+for %%F in ("app.js" "src\worker.js" "public\index.html" "public\app.js" "public\v2.js" "scripts\setup-telegram.mjs") do (
+  if not exist %%F (
+    echo MISSING %%F
+    exit /b 1
+  )
+)
 echo OK: folder structure is correct.
 pause

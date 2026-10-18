@@ -43,12 +43,14 @@ const MEDIA = {
   async get(key) { try { const data=await readFile(mediaPath(key)); return { async arrayBuffer() { return Uint8Array.from(data).buffer; } }; } catch (e) { if (e.code==='ENOENT') return null; throw e; } },
   async delete(key) { try { await unlink(mediaPath(key)); } catch (e) { if (e.code!=='ENOENT') throw e; } }
 };
-const MIME = { '.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.json':'application/json; charset=utf-8','.svg':'image/svg+xml','.jpg':'image/jpeg','.jpeg':'image/jpeg','.png':'image/png','.gif':'image/gif','.webp':'image/webp','.ico':'image/x-icon','.mp4':'video/mp4','.woff2':'font/woff2' };
+const MIME = { '.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.json':'application/json; charset=utf-8','.svg':'image/svg+xml','.jpg':'image/jpeg','.jpeg':'image/jpeg','.png':'image/png','.gif':'image/gif','.webp':'image/webp','.ico':'image/x-icon','.mp4':'video/mp4','.webm':'video/webm','.woff2':'font/woff2' };
 const ASSETS = {async fetch(request) {
   const url=new URL(request.url);
   const location=url.pathname==='/'?'/index.html':url.pathname;
   let decoded;
   try { decoded=decodeURIComponent(location); } catch { return new Response('Bad URL',{status:400}); }
+  // Retired asset: also reject it on deployments that kept an old file.
+  if (decoded === '/meal-plan.js') return new Response('Not found',{status:404});
   const segments=decoded.split('/');
   if (segments.some(s=>s==='..'||s==='.'||s.startsWith('.')) || decoded.includes('\\') || decoded.includes('\0')) return new Response('Not found',{status:404});
   const full=resolve(PUBLIC,'.'+decoded);
@@ -58,8 +60,23 @@ const ASSETS = {async fetch(request) {
   try {
     const meta=await stat(full);
     if (!meta.isFile() || meta.size>8*1024*1024) return new Response('Not found',{status:404});
+    const isVideo=ext==='.mp4'||ext==='.webm';
+    const headers={'Content-Type':MIME[ext],'Content-Length':String(meta.size),'Cache-Control':decoded.startsWith('/media/')?'public, max-age=86400':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'};
+    if(isVideo)headers['Accept-Ranges']='bytes';
+    if(request.method==='HEAD')return new Response(null,{status:200,headers});
+    const range=isVideo?request.headers.get('Range'):null;
+    if(range){
+      const m=/^bytes=(\d*)-(\d*)$/.exec(range);
+      const invalid=()=>new Response(null,{status:416,headers:{...headers,'Content-Range':`bytes */${meta.size}`,'Content-Length':'0'}});
+      if(!m||(!m[1]&&!m[2]))return invalid();
+      let start,end;
+      if(!m[1]){const count=Number(m[2]);if(!Number.isSafeInteger(count)||count<=0)return invalid();start=Math.max(0,meta.size-count);end=meta.size-1;}
+      else{start=Number(m[1]);end=m[2]?Number(m[2]):meta.size-1;if(!Number.isSafeInteger(start)||!Number.isSafeInteger(end)||start>=meta.size||end<start)return invalid();end=Math.min(end,meta.size-1);}
+      const data=await readFile(full);
+      return new Response(data.subarray(start,end+1),{status:206,headers:{...headers,'Content-Range':`bytes ${start}-${end}/${meta.size}`,'Content-Length':String(end-start+1)}});
+    }
     const data=await readFile(full);
-    return new Response(data,{status:200,headers:{'Content-Type':MIME[ext],'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'}});
+    return new Response(data,{status:200,headers});
   } catch (e) { if (e.code==='ENOENT'||e.code==='EISDIR') return new Response('Not found',{status:404}); throw e; }
 }};
 const env = {
@@ -67,9 +84,6 @@ const env = {
   OWNER_TELEGRAM_ID: process.env.OWNER_TELEGRAM_ID?.trim(),
   APP_URL,
   WEBHOOK_SECRET,
-  GEMINI_API_KEY: process.env.GEMINI_API_KEY?.trim(),
-  GEMINI_MODEL: process.env.GEMINI_MODEL?.trim() || 'gemini-3.8-flash',
-  OFF_CONTACT: process.env.OFF_CONTACT?.trim(),
   DB, MEDIA, ASSETS
 };
 
